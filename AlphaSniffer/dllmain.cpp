@@ -17,7 +17,26 @@ VOID WriteBytesASM(DWORD destAddress, LPVOID patch, DWORD numBytes);
 // Create a console
 VOID CreateConsole();
 
-#define NETCLIENT_HANDLEDATA 0x0054E560
+#define CLIENT_BUILD_0_5_3 3368
+#define CLIENT_BUILD_1_12_1 5875
+#define CLIENT_BUILD_2_4_3 8606
+#define CLIENT_BUILD_3_3_5 12340
+
+// Alpha 0.5.3
+#define NETCLIENT_HANDLEDATA_0_5_3 0x0054E560
+
+// Vanilla 1.12.1
+#define NETCLIENT_HANDLEDATA_1_12_1 0x00537C50
+
+// TBC 2.4.3
+#define NETCLIENT_HANDLEDATA_2_4_3 0x0055F9A0
+
+// Wotlk 3.3.5
+#define NETCLIENT_HANDLEDATA_3_3_5 0x00632460
+
+unsigned int g_gameBuild = 0;
+unsigned int g_patchAddress = 0;
+std::map<int, const char*>* g_opcodes = nullptr;
 
 // This variable holds the return address, it must be global!
 DWORD g_returnAddress = 0;
@@ -26,37 +45,51 @@ unsigned int g_timeReceived = 0;
 void* g_data = nullptr;
 int g_size = 0;
 
+char const* GetOpcodeName(unsigned int opcode)
+{
+    auto itr = (*g_opcodes).find(opcode);
+    if (itr != (*g_opcodes).end())
+        return itr->second;
+
+    return "UNKNOWN";
+}
+
 void PrintIncomingPacket()
 {
     printf("[ServerToClient] Time %u, Size %i\n", g_timeReceived, g_size);
     int i = 0;
-    if (g_size >= 4)
-    {
-        char const* name = "UNKNOWN";
-        unsigned int opcode = *((unsigned int*)g_data);
-        auto itr = g_opcodes.find(opcode);
-        if (itr != g_opcodes.end())
-            name = itr->second;
-        printf("Opcode: %u %s\n", opcode, name);
-        i = 4;
-    }
-    printf("Data:\n");
-    for (int j = 0; i < g_size; i++)
-    {
-        j++;
-        unsigned int byte = *(((unsigned char*)g_data) + i);
-        printf("%02x", byte);
 
-        // bytes per line to print
-        if (j == 20)
+    unsigned short opcode = *((unsigned short*)g_data);
+    char const* name = GetOpcodeName(opcode);
+    printf("Opcode: %u %s\n", opcode, name);
+
+    if (g_gameBuild > CLIENT_BUILD_0_5_3)
+        i = 2;
+    else
+        i = 4;
+
+    if (g_size > i)
+    {
+        printf("Data:\n");
+        for (int j = 0; i < g_size; i++)
         {
-            printf("\n");
-            j = 0;
+            j++;
+            unsigned int byte = *(((unsigned char*)g_data) + i);
+            printf("%02x", byte);
+
+            // bytes per line to print
+            if (j == 20)
+            {
+                printf("\n");
+                j = 0;
+            }
+            else
+                printf(" ");
         }
-        else
-            printf(" ");
+        printf("\n");
     }
-    printf("\n\n");
+    
+    printf("\n");
 }
 
 int g_registerEax;
@@ -102,21 +135,93 @@ __declspec(naked) void HandleDataHook(void)
 
 //-----------------------------------------------------------------------------
 
+inline void ReplaceAll(std::string &str, const std::string& from, const std::string& to)
+{
+    size_t startPos = 0;
+    while ((startPos = str.find(from, startPos)) != std::string::npos)
+    {
+        str.replace(startPos, from.length(), to);
+        startPos += to.length();
+    }
+}
+
+unsigned int GetGameVersion()
+{
+    TCHAR filename[MAX_PATH];
+
+    GetModuleFileName(NULL, filename, MAX_PATH);
+
+    DWORD dwHandle, sz = GetFileVersionInfoSizeA(filename, &dwHandle);
+    if (0 == sz)
+    {
+        return 0;
+    }
+    char *buf = new char[sz];
+    if (!GetFileVersionInfoA(filename, dwHandle, sz, &buf[0]))
+    {
+        delete[] buf;
+        return 0;
+    }
+    VS_FIXEDFILEINFO * pvi;
+    sz = sizeof(VS_FIXEDFILEINFO);
+    if (!VerQueryValueA(&buf[0], "\\", (LPVOID*)&pvi, (unsigned int*)&sz))
+    {
+        delete[] buf;
+        return 0;
+    }
+    
+    return pvi->dwFileVersionLS & 0xFFFF;
+}
+
+//-----------------------------------------------------------------------------
+
 // Define the plugins main, use a define since the code is the same for all plugins
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ulReason, LPVOID lpReserved)
 {
     // Get rid of compiler warnings since we do not use this parameter
     UNREFERENCED_PARAMETER(lpReserved);
 
-    // If we are attaching to a process, we do not want the dll thread messages
-    if (ulReason == DLL_PROCESS_ATTACH)
-        DisableThreadLibraryCalls(hModule);
+    if (ulReason != DLL_PROCESS_ATTACH)
+        return TRUE;
 
-    // We will place a codecave at this address
-    Codecave(NETCLIENT_HANDLEDATA, HandleDataHook, 1);
+    // If we are attaching to a process, we do not want the dll thread messages
+    DisableThreadLibraryCalls(hModule);
 
     // Create a console since we are in a DLL
     CreateConsole();
+
+    g_gameBuild = GetGameVersion();
+
+    if (!g_gameBuild)
+        g_gameBuild = CLIENT_BUILD_0_5_3;
+
+    printf("Detected game build %u.\n", g_gameBuild);
+
+    switch (g_gameBuild)
+    {
+        case CLIENT_BUILD_0_5_3:
+            g_patchAddress = NETCLIENT_HANDLEDATA_0_5_3;
+            g_opcodes = &g_opcodes3368;
+            break;
+        case CLIENT_BUILD_1_12_1:
+            g_patchAddress = NETCLIENT_HANDLEDATA_1_12_1;
+            g_opcodes = &g_opcodes5875;
+            break;
+        case CLIENT_BUILD_2_4_3:
+            g_patchAddress = NETCLIENT_HANDLEDATA_2_4_3;
+            g_opcodes = &g_opcodes8606;
+            break;
+        case CLIENT_BUILD_3_3_5:
+            g_patchAddress = NETCLIENT_HANDLEDATA_3_3_5;
+            g_opcodes = &g_opcodes12340;
+            break;
+        default:
+            printf("Unsupported version!\n");
+            return FALSE;
+    }
+
+    // We will place a codecave at this address
+    Codecave(g_patchAddress, HandleDataHook, 1);
 
     // Always load/unload
     return TRUE;
