@@ -6,6 +6,8 @@
 #include <fcntl.h>
 #include <stdio.h>
 #include <io.h>
+#include <ctime>
+#include <string>
 #include "opcodes.h"
 
 // Codecave function
@@ -37,6 +39,8 @@ VOID CreateConsole();
 unsigned int g_gameBuild = 0;
 unsigned int g_patchAddress = 0;
 std::map<int, const char*>* g_opcodes = nullptr;
+FILE* g_sniffFile = nullptr;
+time_t g_startTime = 0;
 
 // This variable holds the return address, it must be global!
 DWORD g_returnAddress = 0;
@@ -47,7 +51,7 @@ int g_size = 0;
 
 char const* GetOpcodeName(unsigned int opcode)
 {
-    auto itr = (*g_opcodes).find(opcode);
+    auto const itr = (*g_opcodes).find(opcode);
     if (itr != (*g_opcodes).end())
         return itr->second;
 
@@ -57,17 +61,32 @@ char const* GetOpcodeName(unsigned int opcode)
 void PrintIncomingPacket()
 {
     printf("[ServerToClient] Time %u, Size %i\n", g_timeReceived, g_size);
-    int i = 0;
-
     unsigned short opcode = *((unsigned short*)g_data);
     char const* name = GetOpcodeName(opcode);
     printf("Opcode: %u %s\n", opcode, name);
 
+    if (g_sniffFile)
+    {
+        unsigned char direction = 0xff;
+        fwrite(&direction, 1, 1, g_sniffFile);
+        unsigned int unixTime = time(nullptr);
+        fwrite(&unixTime, sizeof(unsigned int), 1, g_sniffFile);
+        fwrite(&g_timeReceived, sizeof(unsigned int), 1, g_sniffFile);
+        fwrite(&g_size, sizeof(int), 1, g_sniffFile);
+
+        if (g_size)
+            fwrite(g_data, sizeof(unsigned char), g_size, g_sniffFile);
+
+        // Don't print data to console if writing to file, too much spam.
+        return;
+    }
+
+    int i = 0;
     if (g_gameBuild > CLIENT_BUILD_0_5_3)
         i = 2;
     else
         i = 4;
-
+    
     if (g_size > i)
     {
         printf("Data:\n");
@@ -135,6 +154,47 @@ __declspec(naked) void HandleDataHook(void)
 
 //-----------------------------------------------------------------------------
 
+void StripPathFromFileName(std::string& filename)
+{
+    // Remove path
+    const size_t last_slash_idx = filename.find_last_of("\\/");
+    if (std::string::npos != last_slash_idx)
+    {
+        filename.erase(0, last_slash_idx + 1);
+    }
+
+    // Remove extension
+    const size_t period_idx = filename.rfind('.');
+    if (std::string::npos != period_idx)
+    {
+        filename.erase(period_idx);
+    }
+}
+
+void CreateSniffFile()
+{
+    TCHAR szfileName[MAX_PATH];
+    GetModuleFileName(NULL, szfileName, MAX_PATH);
+    std::string fileName = szfileName;
+    StripPathFromFileName(fileName);
+    fileName += "_" + std::to_string(g_gameBuild) + "_" + std::to_string(g_startTime) + ".pkt";
+    g_sniffFile = fopen(fileName.c_str(), "wb");
+    if (!g_sniffFile)
+        return;
+
+    // Write header
+    fwrite("PKT", 1, 3, g_sniffFile);
+    unsigned short sniffVersion = 0x201;
+    fwrite(&sniffVersion, sizeof(unsigned short), 1, g_sniffFile);
+    unsigned short gameBuild = g_gameBuild;
+    fwrite(&gameBuild, sizeof(unsigned short), 1, g_sniffFile);
+    unsigned char zero = 0;
+    for (int i = 0; i < 40; i++)
+        fwrite(&zero, 1, 1, g_sniffFile);
+}
+
+//-----------------------------------------------------------------------------
+
 unsigned int GetGameVersion()
 {
     TCHAR filename[MAX_PATH];
@@ -172,7 +232,14 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ulReason, LPVOID lpReserved)
     UNREFERENCED_PARAMETER(lpReserved);
 
     if (ulReason != DLL_PROCESS_ATTACH)
+    { 
+        if (g_sniffFile)
+        {
+            fclose(g_sniffFile);
+            g_sniffFile = nullptr;
+        }
         return TRUE;
+    }
 
     // If we are attaching to a process, we do not want the dll thread messages
     DisableThreadLibraryCalls(hModule);
@@ -180,6 +247,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ulReason, LPVOID lpReserved)
     // Create a console since we are in a DLL
     CreateConsole();
 
+    g_startTime = std::time(nullptr);
     g_gameBuild = GetGameVersion();
 
     if (!g_gameBuild)
@@ -209,6 +277,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ulReason, LPVOID lpReserved)
             printf("Unsupported version!\n");
             return FALSE;
     }
+
+    // Save all packets to file
+    CreateSniffFile();
 
     // We will place a codecave at this address
     Codecave(g_patchAddress, HandleDataHook, 1);
